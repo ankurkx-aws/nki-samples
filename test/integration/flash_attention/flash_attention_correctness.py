@@ -21,7 +21,9 @@ from flash_attention import nki_flash_attn_func
     (True, float("inf")),   # causal, sliding window size same as sequence length
     (False, -1),            # non-causal, no sliding window
 ])
-def test_attention(dtype, causal, sliding_window):
+@pytest.mark.parametrize('num_heads', [4, 16])
+@pytest.mark.parametrize('seq_len', [4096, 8192])
+def test_attention(dtype, causal, sliding_window, num_heads, seq_len):
     def torch_golden_attn_cpu(query_states, key_states, value_states, causal, sliding_window):
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * (query_states.shape[-1] ** (-0.5))
 
@@ -47,9 +49,7 @@ def test_attention(dtype, causal, sliding_window):
 
     torch.manual_seed(0)
     bs = 1
-    num_heads = 4
     head_dim = 128
-    seq_len = 4096
     query_states_cpu = torch.randn(bs, num_heads, seq_len, head_dim, dtype=dtype) - 0.5
     query_states_cpu.requires_grad_()
     key_states_cpu = torch.randn(bs, num_heads, seq_len, head_dim, dtype=dtype) - 0.5
@@ -80,3 +80,58 @@ def test_attention(dtype, causal, sliding_window):
     assert(allclose(actual_dv.to(torch.float32).numpy(), value_states_cpu.grad.to(torch.float32).numpy(), atol=1e-5, rtol=0.05, verbose=1))
     assert(allclose(actual_dq.to(torch.float32).numpy(), query_states_cpu.grad.to(torch.float32).numpy(), atol=1e-5, rtol=0.05, verbose=1))
     assert(allclose(actual_dk.to(torch.float32).numpy(), key_states_cpu.grad.to(torch.float32).numpy(), atol=1e-5, rtol=0.05, verbose=1))
+
+
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize('causal,sliding_window', [
+    (True, -1),             # causal, no sliding window
+    (True, 128),            # causal, sliding window of size 128
+    (True, float("inf")),   # causal, sliding window size same as sequence length
+    (False, -1),            # non-causal, no sliding window
+])
+@pytest.mark.parametrize('num_heads', [4, 16])
+@pytest.mark.parametrize('seq_len', [4096, 8192])
+def test_attention_bwd_compute_skip(dtype, causal, sliding_window, num_heads, seq_len):
+    torch.manual_seed(0)
+    bs = 1
+    head_dim = 128
+    query_states_cpu = torch.randn(bs, num_heads, seq_len, head_dim, dtype=dtype) - 0.5
+    query_states_cpu.requires_grad_()
+    key_states_cpu = torch.randn(bs, num_heads, seq_len, head_dim, dtype=dtype) - 0.5
+    key_states_cpu.requires_grad_()
+    value_states_cpu = torch.randn(bs, num_heads, seq_len, head_dim, dtype=dtype) - 0.5
+    value_states_cpu.requires_grad_()
+
+    # Run the Neuron kernel implementation without compute skip
+    query_states = query_states_cpu.to(xm.xla_device()).detach().requires_grad_()
+    key_states = key_states_cpu.to(xm.xla_device()).detach().requires_grad_()
+    value_states = value_states_cpu.to(xm.xla_device()).detach().requires_grad_()
+    attn_nki = nki_flash_attn_func(query_states, key_states, value_states, causal=causal, sliding_window=sliding_window, compute_skip=False)
+    loss = torch.sum(attn_nki**2)
+    loss.backward()
+    xm.mark_step()
+
+    dv = value_states.grad.to('cpu')
+    dq = query_states.grad.to('cpu')
+    dk = key_states.grad.to('cpu')
+
+    # Run the Neuron kernel implementation with compute skip
+    query_states_fast = query_states_cpu.to(xm.xla_device()).detach().requires_grad_()
+    key_states_fast = key_states_cpu.to(xm.xla_device()).detach().requires_grad_()
+    value_states_fast = value_states_cpu.to(xm.xla_device()).detach().requires_grad_()
+    attn_nki_fast = nki_flash_attn_func(
+        query_states_fast, key_states_fast, value_states_fast, causal=causal, sliding_window=sliding_window, compute_skip=True
+    )
+    loss_fast = torch.sum(attn_nki_fast**2)
+    loss_fast.backward()
+    xm.mark_step()
+
+    dv_fast = value_states_fast.grad.to('cpu')
+    dq_fast = query_states_fast.grad.to('cpu')
+    dk_fast = key_states_fast.grad.to('cpu')
+
+    # Compare against cpu result
+    assert(allclose(loss.to('cpu').to(torch.float32).detach().numpy(), loss_fast.to('cpu').to(torch.float32).detach().numpy(), atol=1e-5, rtol=0.05, verbose=1))
+    assert(allclose(dv.to(torch.float32).numpy(), dv_fast.to(torch.float32).numpy(), atol=1e-5, rtol=0.0, verbose=1))
+    assert(allclose(dq.to(torch.float32).numpy(), dq_fast.to(torch.float32).numpy(), atol=1e-5, rtol=0.0, verbose=1))
+    assert(allclose(dk.to(torch.float32).numpy(), dk_fast.to(torch.float32).numpy(), atol=1e-5, rtol=0.0, verbose=1))

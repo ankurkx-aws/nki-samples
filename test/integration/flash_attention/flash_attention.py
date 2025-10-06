@@ -25,7 +25,7 @@ def _flash_attn_forward(q, k, v, causal, mixed_precision, seed, dropout_p, softm
     return attn_output, lse
 
 
-def _flash_attn_backward(q, k, v, o, dout, lse, seed, causal, mixed_precision, dropout_p, softmax_scale, sliding_window):
+def _flash_attn_backward(q, k, v, o, dout, lse, seed, causal, mixed_precision, dropout_p, softmax_scale, sliding_window, compute_skip):
     bs, num_heads, _, _ = q.shape
     dq, dk, dv = flash_attn_bwd[bs, num_heads](
         q,
@@ -40,6 +40,7 @@ def _flash_attn_backward(q, k, v, o, dout, lse, seed, causal, mixed_precision, d
         dropout_p=dropout_p,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
+        compute_skip=compute_skip,
     )
     return dq, dk, dv
 
@@ -57,6 +58,7 @@ class NKIAttnFunc(torch.autograd.Function):
         seed,
         dropout_p: float,
         sliding_window: int,
+        compute_skip: bool,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-2] ** (-0.5)
@@ -83,6 +85,7 @@ class NKIAttnFunc(torch.autograd.Function):
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.sliding_window = sliding_window
+        ctx.compute_skip = compute_skip
 
         # Move seed manually if the dropout is used
         # https://github.com/pytorch/xla/blob/v1.13.0/torch_xla/csrc/tensor.cpp#L323
@@ -110,8 +113,9 @@ class NKIAttnFunc(torch.autograd.Function):
             dropout_p=ctx.dropout_p,
             softmax_scale=ctx.softmax_scale,
             sliding_window=ctx.sliding_window,
+            compute_skip=ctx.compute_skip,
         )
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 def nki_flash_attn_func(
     q,
@@ -123,6 +127,7 @@ def nki_flash_attn_func(
     mixed_precision=True,
     seed=None,
     sliding_window=-1,
+    compute_skip=True,
 ):
     """
     Arguments:
@@ -154,4 +159,4 @@ def nki_flash_attn_func(
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)
 
-    return NKIAttnFunc.apply(q, k, v, softmax_scale, causal, mixed_precision, seed, dropout_p, sliding_window)
+    return NKIAttnFunc.apply(q, k, v, softmax_scale, causal, mixed_precision, seed, dropout_p, sliding_window, compute_skip)
