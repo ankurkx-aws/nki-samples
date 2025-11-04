@@ -367,6 +367,7 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
     assert tuple(v.shape) == (b, k_h, seqlen_k, d), f"Expect shape of V to be {(b, k_h, seqlen_k, d)} (batch, heads, seqlen_k, d_head) but got {v.shape}"
     assert tuple(k.shape) == (b, k_h, d, seqlen_k), f"Expect shape of K to be {(b, k_h, d, seqlen_k)} (batch, heads, d_head, seqlen_k) but got {k.shape}"
   assert d <= 128, f" we do not support head_dim > 128, got head dim {d}"
+  sliding_window = min(sliding_window, seqlen_k)
   use_causal_mask = True if sliding_window > 0 else use_causal_mask  # setting sliding window assumes causal
   kernel_dtype = nl.bfloat16 if mixed_precision else q.dtype
   acc_type = np.dtype(np.float32) if mixed_precision else kernel_dtype
@@ -528,6 +529,8 @@ def flash_attn_bwd(
   mixed_precision=False,
   dropout_p=0.0,
   softmax_scale=None,
+  sliding_window=-1,
+  compute_skip=True,
 ):
   """
   Flash attention backward kernel. Compute the backward gradients.
@@ -575,6 +578,7 @@ def flash_attn_bwd(
   # Shape checking
   bs, nheads, d_head, seqlen_q = q_ref.shape
   _, _, _, seqlen_k = k_ref.shape
+  sliding_window = min(sliding_window, seqlen_k)
   assert tuple(k_ref.shape) == (bs, nheads, d_head, seqlen_k), \
     f"Input K shape mismatch, got {k_ref.shape}"
   assert tuple(v_ref.shape) == (bs, nheads, d_head, seqlen_k), \
@@ -690,33 +694,45 @@ def flash_attn_bwd(
       dy_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=kernel_dtype)
       q_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=kernel_dtype)
 
-      load_dy_q(dy_ref_hbm_tile = dy_ref[batch_id, head_id],
-                q_ref_hbm_tile = q_ref[batch_id, head_id],
-                dy_local=dy_local, q_local=q_local, d_head_n_tiles=d_head_n_tiles,
-                d_head_tile_size=d_head_tile_size, i_q_seq_tile=i_q_seq_tile,
-                q_seq_tile_size=q_seq_tile_size, softmax_scale=softmax_scale)
+      # Skip tile if none of the key/value pairs are attended
+      if use_causal_mask and compute_skip:
+        multiplication_required_selection = i_q_seq_tile * q_seq_tile_size + q_seq_tile_size > i_k_seq_tile * k_seq_tile_size
+        if sliding_window > 0:
+          multiplication_required_selection = multiplication_required_selection and (
+            i_q_seq_tile * q_seq_tile_size - sliding_window < i_k_seq_tile * k_seq_tile_size + k_seq_tile_size
+          )
+      else:
+        multiplication_required_selection = True
 
-      logit_bias_tile = None
-      if logit_bias_ref is not None:
-        i_q_seq_dslice = nl.ds(i_q_seq_tile * q_seq_tile_size, q_seq_tile_size)
-        logit_bias_tile = nl.ndarray((par_dim(q_seq_tile_size), k_seq_tile_size),
-                                     buffer=nl.sbuf, dtype=kernel_dtype)
-        logit_bias_tile[:, :] = nl.load(
-          logit_bias_ref[0, 0, i_q_seq_dslice, i_k_seq_dslice])
+      if multiplication_required_selection:
+        load_dy_q(dy_ref_hbm_tile = dy_ref[batch_id, head_id],
+                  q_ref_hbm_tile = q_ref[batch_id, head_id],
+                  dy_local=dy_local, q_local=q_local, d_head_n_tiles=d_head_n_tiles,
+                  d_head_tile_size=d_head_tile_size, i_q_seq_tile=i_q_seq_tile,
+                  q_seq_tile_size=q_seq_tile_size, softmax_scale=softmax_scale)
 
-      _flash_attn_bwd_core(
-        q_local=q_local, k_local=k_local, transposed_k_local=transposed_k_local,
-        v_local=v_local, dy_local=dy_local,
-        dk_psum=dk_psum, dv_psum=dv_psum, dq_local_reduced=dq_local_reduced,
-        softmax_exp_bias=softmax_exp_bias, dy_o_sum=dy_o_sum,
-        local_i_q_seq_tile=i_q_seq_tile, local_i_k_seq_tile=i_k_seq_tile,
-        seqlen_q=seqlen_q, seqlen_k=seqlen_k, d_head=d_head, nheads=nheads,
-        use_causal_mask=use_causal_mask,
-        kernel_dtype=kernel_dtype, mixed_dtype=mixed_dtype,
-        softmax_scale=softmax_scale,
-        seed_local=seed_local, dropout_p=dropout_p, dropout_p_local=dropout_p_local,
-        logit_bias_tile=logit_bias_tile
-      )
+        logit_bias_tile = None
+        if logit_bias_ref is not None:
+          i_q_seq_dslice = nl.ds(i_q_seq_tile * q_seq_tile_size, q_seq_tile_size)
+          logit_bias_tile = nl.ndarray((par_dim(q_seq_tile_size), k_seq_tile_size),
+                                       buffer=nl.sbuf, dtype=kernel_dtype)
+          logit_bias_tile[:, :] = nl.load(
+            logit_bias_ref[0, 0, i_q_seq_dslice, i_k_seq_dslice])
+
+        _flash_attn_bwd_core(
+          q_local=q_local, k_local=k_local, transposed_k_local=transposed_k_local,
+          v_local=v_local, dy_local=dy_local,
+          dk_psum=dk_psum, dv_psum=dv_psum, dq_local_reduced=dq_local_reduced,
+          softmax_exp_bias=softmax_exp_bias, dy_o_sum=dy_o_sum,
+          local_i_q_seq_tile=i_q_seq_tile, local_i_k_seq_tile=i_k_seq_tile,
+          seqlen_q=seqlen_q, seqlen_k=seqlen_k, d_head=d_head, nheads=nheads,
+          use_causal_mask=use_causal_mask,
+          kernel_dtype=kernel_dtype, mixed_dtype=mixed_dtype,
+          softmax_scale=softmax_scale,
+          seed_local=seed_local, dropout_p=dropout_p, dropout_p_local=dropout_p_local,
+          logit_bias_tile=logit_bias_tile,
+          sliding_window=sliding_window,
+        )
 
     # Write dK, dV
     store_dk_dv(out_dk_ref_hbm_tile=out_dk_ref[batch_id, head_id],
@@ -821,7 +837,7 @@ def _flash_attn_bwd_core(
   kernel_dtype, mixed_dtype,
   softmax_scale,
   seed_local, dropout_p, dropout_p_local,
-  logit_bias_tile=None):
+  logit_bias_tile=None, sliding_window=0):
   """
   The flash backward core function to calculate the gradients of Q, K and V
   of the given tiles. The result will be accumulated into the dk, dv, dq psum
@@ -875,6 +891,17 @@ def _flash_attn_bwd_core(
         pred=causal_pred,
         on_true_tile=qk_psum[:, :], on_false_value=-9984.0, dtype=mixed_dtype,
         mask=mask)
+    
+    if sliding_window > 0:
+      swa_pred = local_i_q_seq_tile * q_seq_tile_size + iq - sliding_window < local_i_k_seq_tile * k_seq_tile_size + ik
+      qk_res_buf[:, :] = nisa.affine_select(
+        pred=swa_pred,
+        on_true_tile=qk_res_buf[:, :],
+        on_false_value=-9984.0,
+        dtype=mixed_dtype,
+        mask=mask,
+      )
+
   else:
     if logit_bias_tile is not None:
       # Simply add logit bias which copies back to sbuf at the same time
